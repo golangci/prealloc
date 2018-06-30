@@ -1,4 +1,4 @@
-package main
+package prealloc
 
 import (
 	"errors"
@@ -24,11 +24,6 @@ const (
 	pwd = "./"
 )
 
-func init() {
-	// Ignore build flags
-	build.Default.UseAllFiles = true
-}
-
 func usage() {
 	log.Printf("Usage of %s:\n", os.Args[0])
 	log.Printf("\nprealloc [flags] # runs on package in current directory\n")
@@ -44,7 +39,6 @@ type sliceDeclaration struct {
 }
 
 type returnsVisitor struct {
-	f *token.FileSet
 	// flags
 	simple            bool
 	includeRangeLoops bool
@@ -56,7 +50,7 @@ type returnsVisitor struct {
 	arrayTypes          []string
 }
 
-func main() {
+func NoMain() {
 
 	// Remove log timestamp
 	log.SetFlags(0)
@@ -105,7 +99,6 @@ func checkForPreallocations(args []string, simple, includeRangeLoops *bool, incl
 	hints := []Hint{}
 	for _, f := range files {
 		retVis := &returnsVisitor{
-			f:                 fset,
 			simple:            *simple,
 			includeRangeLoops: *includeRangeLoops,
 			includeForLoops:   *includeForLoops,
@@ -119,6 +112,26 @@ func checkForPreallocations(args []string, simple, includeRangeLoops *bool, incl
 	}
 
 	return hints, nil
+}
+
+func Check(files []*ast.File, simple, includeRangeLoops, includeForLoops bool) []Hint {
+	hints := []Hint{}
+	for _, f := range files {
+		retVis := &returnsVisitor{
+			simple:            simple,
+			includeRangeLoops: includeRangeLoops,
+			includeForLoops:   includeForLoops,
+		}
+		ast.Walk(retVis, f)
+
+		// if simple is true, then we actually have to check if we had returns
+		// inside of our loop. Otherwise, we can just report all messages.
+		if !retVis.simple || !retVis.returnsInsideOfLoop {
+			hints = append(hints, retVis.preallocHints...)
+		}
+	}
+
+	return hints
 }
 
 func parseInput(args []string, fset *token.FileSet) ([]*ast.File, error) {
@@ -340,8 +353,6 @@ func (v *returnsVisitor) handleLoops(blockStmt *ast.BlockStmt) {
 						}
 						for _, sliceDecl := range v.sliceDeclarations {
 							if sliceDecl.name == lhsIdent.Name {
-								file := v.f.File(sliceDecl.genD.Pos())
-								lineNumber := file.Position(sliceDecl.genD.Pos()).Line
 								// This is a potential mark, we just need to make sure there are no returns/continues in the
 								// range loop.
 								// now we just need to grab whatever we're ranging over
@@ -351,8 +362,7 @@ func (v *returnsVisitor) handleLoops(blockStmt *ast.BlockStmt) {
 								}*/
 
 								v.preallocHints = append(v.preallocHints, Hint{
-									Filename:          file.Name(),
-									LineNumber:        lineNumber,
+									Pos:               sliceDecl.genD.Pos(),
 									DeclaredSliceName: sliceDecl.name,
 								})
 							}
@@ -384,11 +394,10 @@ func (v *returnsVisitor) handleLoops(blockStmt *ast.BlockStmt) {
 // Hint stores the information about an occurence of a slice that could be
 // preallocated.
 type Hint struct {
-	Filename          string
-	LineNumber        int
+	Pos               token.Pos
 	DeclaredSliceName string
 }
 
 func (h Hint) String() string {
-	return fmt.Sprintf("%v:%v Consider preallocating %v", h.Filename, h.LineNumber, h.DeclaredSliceName)
+	return fmt.Sprintf("%v: Consider preallocating %v", h.Pos, h.DeclaredSliceName)
 }
