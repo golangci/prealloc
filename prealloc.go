@@ -1,7 +1,6 @@
 package prealloc
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -82,18 +81,6 @@ func checkForPreallocations(args []string, simple, includeRangeLoops *bool, incl
 	files, err := parseInput(args, fset)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse input %v", err)
-	}
-
-	if simple == nil {
-		return nil, errors.New("simple nil")
-	}
-
-	if includeRangeLoops == nil {
-		return nil, errors.New("includeRangeLoops nil")
-	}
-
-	if includeForLoops == nil {
-		return nil, errors.New("includeForLoops nil")
 	}
 
 	hints := []Hint{}
@@ -305,6 +292,16 @@ func (v *returnsVisitor) Visit(node ast.Node) ast.Visitor {
 						if len(v.sliceDeclarations) == 0 {
 							continue
 						}
+						// Check the value being ranged over and ensure it's not a channel (we cannot offer any recommendations on channel ranges).
+						rangeIdent, ok := s.X.(*ast.Ident)
+						if ok && rangeIdent.Obj != nil {
+							valueSpec, ok := rangeIdent.Obj.Decl.(*ast.ValueSpec)
+							if ok {
+								if _, rangeTargetIsChannel := valueSpec.Type.(*ast.ChanType); rangeTargetIsChannel {
+									continue
+								}
+							}
+						}
 						if s.Body != nil {
 							v.handleLoops(s.Body)
 						}
@@ -335,40 +332,70 @@ func (v *returnsVisitor) handleLoops(blockStmt *ast.BlockStmt) {
 		switch bodyStmt := stmt.(type) {
 		case *ast.AssignStmt:
 			asgnStmt := bodyStmt
-			for _, expr := range asgnStmt.Rhs {
-				callExpr, ok := expr.(*ast.CallExpr)
-				if !ok {
-					continue // should this be break? comes back to multi-call support I think
+			for index, expr := range asgnStmt.Rhs {
+				if index >= len(asgnStmt.Lhs) {
+					continue
 				}
-				ident, ok := callExpr.Fun.(*ast.Ident)
+
+				lhsIdent, ok := asgnStmt.Lhs[index].(*ast.Ident)
 				if !ok {
 					continue
 				}
-				if ident.Name == "append" {
-					// see if this append is appending the slice we found
-					for _, lhsExpr := range asgnStmt.Lhs {
-						lhsIdent, ok := lhsExpr.(*ast.Ident)
+
+				callExpr, ok := expr.(*ast.CallExpr)
+				if !ok {
+					continue
+				}
+
+				rhsFuncIdent, ok := callExpr.Fun.(*ast.Ident)
+				if !ok {
+					continue
+				}
+
+				if rhsFuncIdent.Name != "append" {
+					continue
+				}
+
+				// e.g., `x = append(x)`
+				// Pointless, but pre-allocation will not help.
+				if len(callExpr.Args) < 2 {
+					continue
+				}
+
+				rhsIdent, ok := callExpr.Args[0].(*ast.Ident)
+				if !ok {
+					continue
+				}
+
+				// e.g., `x = append(y, a)`
+				// This is weird (and maybe a logic error),
+				// but we cannot recommend pre-allocation.
+				if lhsIdent.Name != rhsIdent.Name {
+					continue
+				}
+
+				// e.g., `x = append(x, y...)`
+				// we should ignore this. Pre-allocating in this case
+				// is confusing, and is not possible in general.
+				if callExpr.Ellipsis.IsValid() {
+					continue
+				}
+
+				for _, sliceDecl := range v.sliceDeclarations {
+					if sliceDecl.name == lhsIdent.Name {
+						// This is a potential mark, we just need to make sure there are no returns/continues in the
+						// range loop.
+						// now we just need to grab whatever we're ranging over
+						/*sxIdent, ok := s.X.(*ast.Ident)
 						if !ok {
 							continue
-						}
-						for _, sliceDecl := range v.sliceDeclarations {
-							if sliceDecl.name == lhsIdent.Name {
-								// This is a potential mark, we just need to make sure there are no returns/continues in the
-								// range loop.
-								// now we just need to grab whatever we're ranging over
-								/*sxIdent, ok := s.X.(*ast.Ident)
-								if !ok {
-									continue
-								}*/
+						 */
 
-								v.preallocHints = append(v.preallocHints, Hint{
-									Pos:               sliceDecl.genD.Pos(),
-									DeclaredSliceName: sliceDecl.name,
-								})
-							}
-						}
+						v.preallocHints = append(v.preallocHints, Hint{
+							Pos:               sliceDecl.genD.Pos(),
+							DeclaredSliceName: sliceDecl.name,
+						})
 					}
-
 				}
 			}
 		case *ast.IfStmt:
@@ -391,7 +418,7 @@ func (v *returnsVisitor) handleLoops(blockStmt *ast.BlockStmt) {
 
 }
 
-// Hint stores the information about an occurence of a slice that could be
+// Hint stores the information about an occurrence of a slice that could be
 // preallocated.
 type Hint struct {
 	Pos               token.Pos
